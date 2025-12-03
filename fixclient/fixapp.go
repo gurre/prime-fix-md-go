@@ -129,6 +129,7 @@ type FixApp struct {
 
 	SessionId  quickfix.SessionID
 	TradeStore *TradeStore
+	OrderStore *OrderStore
 	Db         *database.MarketDataDb
 
 	shouldExit    bool
@@ -148,10 +149,12 @@ func NewConfig(apiKey, apiSecret, passphrase, senderCompId, targetCompId, portfo
 
 func NewFixApp(config *Config, db *database.MarketDataDb) *FixApp {
 	tradeStore := NewTradeStore(10000, "")
+	orderStore := NewOrderStore()
 
 	return &FixApp{
 		Config:     config,
 		TradeStore: tradeStore,
+		OrderStore: orderStore,
 		Db:         db,
 		shouldExit: false,
 	}
@@ -171,7 +174,10 @@ func (a *FixApp) OnLogout(sid quickfix.SessionID) {
 	}
 }
 
-func (a *FixApp) FromAdmin(_ *quickfix.Message, _ quickfix.SessionID) quickfix.MessageRejectError {
+func (a *FixApp) FromAdmin(msg *quickfix.Message, _ quickfix.SessionID) quickfix.MessageRejectError {
+	if t, _ := msg.Header.GetString(constants.TagMsgType); t == constants.MsgTypeReject {
+		a.handleSessionReject(msg)
+	}
 	return nil
 }
 
@@ -206,12 +212,28 @@ func (a *FixApp) ToAdmin(msg *quickfix.Message, _ quickfix.SessionID) {
 // HOT PATH [1]: Called by quickfix for every incoming message.
 // Performance: ~50ns for type check and routing.
 func (a *FixApp) FromApp(msg *quickfix.Message, _ quickfix.SessionID) quickfix.MessageRejectError {
-	// HOT PATH: Single string comparison to route market data messages
-	if t, _ := msg.Header.GetString(constants.TagMsgType); t == constants.MsgTypeMarketDataSnapshot || t == constants.MsgTypeMarketDataIncremental {
-		a.handleMarketDataMessage(msg) // HOT PATH continues
-	} else if t == "Y" { // Market Data Request Reject
+	t, _ := msg.Header.GetString(constants.TagMsgType)
+
+	switch t {
+	// HOT PATH: Market data messages
+	case constants.MsgTypeMarketDataSnapshot, constants.MsgTypeMarketDataIncremental:
+		a.handleMarketDataMessage(msg)
+	case constants.MsgTypeMarketDataReject:
 		a.handleMarketDataReject(msg)
-	} else {
+
+	// Order entry messages
+	case constants.MsgTypeExecutionReport:
+		a.handleExecutionReport(msg)
+	case constants.MsgTypeOrderCancelReject:
+		a.handleOrderCancelReject(msg)
+	case constants.MsgTypeQuote:
+		a.handleQuote(msg)
+	case constants.MsgTypeQuoteAcknowledgement:
+		a.handleQuoteAck(msg)
+	case constants.MsgTypeBusinessReject:
+		a.handleBusinessReject(msg)
+
+	default:
 		log.Printf("Received application message type %s", t)
 	}
 	return nil
@@ -291,4 +313,124 @@ func (a *FixApp) handleMarketDataMessage(msg *quickfix.Message) {
 	} else if isIncremental {
 		a.displayIncrementalTrades(trades)
 	}
+}
+
+// handleExecutionReport processes Execution Report (8) messages.
+// Updates order state and displays execution details.
+//
+// TODO: MiscFees repeating group (Tags 136-139) is not currently parsed.
+// Per Coinbase Prime FIX API, Execution Reports may contain:
+//   - Tag 136 (NoMiscFees) - number of fee entries
+//   - Tag 137 (MiscFeeAmt) - fee amount
+//   - Tag 138 (MiscFeeCurr) - fee currency
+//   - Tag 139 (MiscFeeType) - fee type (1=Financing, 2=ClientComm, 3=CESComm, 4=VenueFee)
+//
+// See: https://docs.cdp.coinbase.com/prime/fix-api/order-entry-messages
+func (a *FixApp) handleExecutionReport(msg *quickfix.Message) {
+	er := &ExecutionReport{
+		ClOrdID:      utils.GetString(msg, constants.TagClOrdID),
+		OrderID:      utils.GetString(msg, constants.TagOrderID),
+		ExecID:       utils.GetString(msg, constants.TagExecID),
+		Account:      utils.GetString(msg, constants.TagAccount),
+		Symbol:       utils.GetString(msg, constants.TagSymbol),
+		OrdStatus:    utils.GetString(msg, constants.TagOrdStatus),
+		ExecType:     utils.GetString(msg, constants.TagExecType),
+		Side:         utils.GetString(msg, constants.TagSide),
+		OrdType:      utils.GetString(msg, constants.TagOrdType),
+		OrderQty:     utils.GetString(msg, constants.TagOrderQty),
+		CumQty:       utils.GetString(msg, constants.TagCumQty),
+		LeavesQty:    utils.GetString(msg, constants.TagLeavesQty),
+		CashOrderQty: utils.GetString(msg, constants.TagCashOrderQty),
+		Price:        utils.GetString(msg, constants.TagPrice),
+		AvgPx:        utils.GetString(msg, constants.TagAvgPx),
+		LastPx:       utils.GetString(msg, constants.TagLastPx),
+		LastShares:   utils.GetString(msg, constants.TagLastShares),
+		Commission:   utils.GetString(msg, constants.TagCommission),
+		FilledAmt:    utils.GetString(msg, constants.TagFilledAmt),
+		NetAvgPx:     utils.GetString(msg, constants.TagNetAvgPrice),
+		OrdRejReason: utils.GetString(msg, constants.TagOrdRejReason),
+		Text:         utils.GetString(msg, constants.TagText),
+	}
+
+	a.OrderStore.UpdateOrderFromExecReport(er)
+	a.displayExecutionReport(er)
+}
+
+// handleOrderCancelReject processes Order Cancel Reject (9) messages.
+func (a *FixApp) handleOrderCancelReject(msg *quickfix.Message) {
+	reject := &OrderCancelReject{
+		ClOrdID:          utils.GetString(msg, constants.TagClOrdID),
+		OrigClOrdID:      utils.GetString(msg, constants.TagOrigClOrdID),
+		OrderID:          utils.GetString(msg, constants.TagOrderID),
+		OrdStatus:        utils.GetString(msg, constants.TagOrdStatus),
+		CxlRejReason:     utils.GetString(msg, constants.TagCxlRejReason),
+		CxlRejResponseTo: utils.GetString(msg, constants.TagCxlRejResponseTo),
+		Text:             utils.GetString(msg, constants.TagText),
+	}
+
+	a.displayOrderCancelReject(reject)
+}
+
+// handleQuote processes Quote (S) messages from RFQ responses.
+func (a *FixApp) handleQuote(msg *quickfix.Message) {
+	quote := &Quote{
+		QuoteID:    utils.GetString(msg, constants.TagQuoteID),
+		QuoteReqID: utils.GetString(msg, constants.TagQuoteReqID),
+		Account:    utils.GetString(msg, constants.TagAccount),
+		Symbol:     utils.GetString(msg, constants.TagSymbol),
+		BidPx:      utils.GetString(msg, constants.TagBidPx),
+		BidSize:    utils.GetString(msg, constants.TagBidSize),
+		OfferPx:    utils.GetString(msg, constants.TagOfferPx),
+		OfferSize:  utils.GetString(msg, constants.TagOfferSize),
+	}
+
+	// Parse ValidUntilTime if present
+	if validUntil := utils.GetString(msg, constants.TagValidUntilTime); validUntil != "" {
+		if t, err := time.Parse(constants.FixTimeFormat, validUntil); err == nil {
+			quote.ValidUntilTime = t
+		}
+	}
+
+	a.OrderStore.AddQuote(quote)
+	a.displayQuote(quote)
+}
+
+// handleQuoteAck processes Quote Acknowledgement (b) messages (rejections).
+func (a *FixApp) handleQuoteAck(msg *quickfix.Message) {
+	ack := &QuoteAck{
+		QuoteID:           utils.GetString(msg, constants.TagQuoteID),
+		QuoteReqID:        utils.GetString(msg, constants.TagQuoteReqID),
+		Account:           utils.GetString(msg, constants.TagAccount),
+		Symbol:            utils.GetString(msg, constants.TagSymbol),
+		QuoteAckStatus:    utils.GetString(msg, constants.TagQuoteAckStatus),
+		QuoteRejectReason: utils.GetString(msg, constants.TagQuoteRejectReason),
+		Text:              utils.GetString(msg, constants.TagText),
+	}
+
+	a.displayQuoteAck(ack)
+}
+
+// handleSessionReject processes session-level Reject (3) messages.
+func (a *FixApp) handleSessionReject(msg *quickfix.Message) {
+	reject := &SessionReject{
+		RefSeqNum:           utils.GetString(msg, constants.TagRefSeqNum),
+		RefMsgType:          utils.GetString(msg, constants.TagRefMsgType),
+		RefTagID:            utils.GetString(msg, constants.TagRefTagID),
+		SessionRejectReason: utils.GetString(msg, constants.TagSessionRejectReason),
+		Text:                utils.GetString(msg, constants.TagText),
+	}
+
+	a.displaySessionReject(reject)
+}
+
+// handleBusinessReject processes Business Message Reject (j) messages.
+func (a *FixApp) handleBusinessReject(msg *quickfix.Message) {
+	reject := &BusinessReject{
+		RefSeqNum:            utils.GetString(msg, constants.TagRefSeqNum),
+		RefMsgType:           utils.GetString(msg, constants.TagRefMsgType),
+		BusinessRejectReason: utils.GetString(msg, constants.TagBusinessRejectReason),
+		Text:                 utils.GetString(msg, constants.TagText),
+	}
+
+	a.displayBusinessReject(reject)
 }

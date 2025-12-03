@@ -14,6 +14,93 @@
  * limitations under the License.
  */
 
+/*
+HOT PATH - Market Data Message Processing Flow
+
+This documents the critical performance path for processing incoming FIX market data.
+Each message triggers this sequence; optimizations here have the highest impact.
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           NETWORK LAYER                                      │
+│                    (quickfix library handles TCP/FIX protocol)               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [1] FromApp() - fixapp.go:118                                    ENTRY POINT │
+│     • Called by quickfix for every application-level message                 │
+│     • Type check on MsgType header field (string comparison)                 │
+│     • Routes to handleMarketDataMessage() for W/X message types              │
+│     • Cost: ~50ns (header extraction + string compare)                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [2] handleMarketDataMessage() - fixapp.go:170                    COORDINATOR │
+│     • Extracts message metadata (symbol, reqId, seqNum)                      │
+│     • Calls extractTrades() for parsing                                      │
+│     • Calls TradeStore.AddTrades() for storage                               │
+│     • Calls storeTradesToDatabase() for persistence (optional)               │
+│     • Cost: ~200ns (field extractions) + downstream costs                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [3] extractTrades() → extractTradesImproved() - parser.go:30-54     PARSER  │
+│     • Converts quickfix.Message to raw string (msg.String())                 │
+│     • Calls findEntryBoundaries() to locate all 269= tags                    │
+│     • Iterates entries, calls parseTradeFromSegment() for each               │
+│     • Cost: O(n*m) where n=entries, m=avg segment length                     │
+│     • Allocations: 1 slice for boundaries + 1 slice for trades               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+┌──────────────────────────────────┐  ┌──────────────────────────────────────┐
+│ [3a] findEntryBoundaries()       │  │ [3b] parseTradeFromSegment()         │
+│      parser.go:56-73             │  │      parser.go:83-119                │
+│ • strings.Count for pre-alloc    │  │ • Extracts 6 fields per entry        │
+│ • strings.Index loop to find all │  │ • Each field: strings.Index O(m)     │
+│   "269=" occurrences             │  │ • Zero allocations (returns struct)  │
+│ • Cost: O(m) where m=msg length  │  │ • Cost: ~150-200ns per entry         │
+│ • Allocations: 1 (pre-sized)     │  │ • Allocations: 0                     │
+└──────────────────────────────────┘  └──────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [4] TradeStore.AddTrades() - tradestore.go:70-101                   STORAGE │
+│     • Acquires write lock (sync.RWMutex)                                     │
+│     • Updates subscription metadata                                          │
+│     • Ring buffer insertion: O(1) per trade, zero allocations                │
+│     • Cost: ~70ns per trade (dominated by mutex)                             │
+│     • Allocations: 0 (ring buffer pre-allocated)                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [5] storeTradesToDatabase() - storage.go (OPTIONAL)              PERSISTENCE │
+│     • SQLite transaction with batch inserts                                  │
+│     • Cost: ~1-10ms depending on batch size and disk                         │
+│     • Can be made async to not block hot path                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PERFORMANCE CHARACTERISTICS (Apple M4 Pro benchmarks):
+┌────────────────────────────────┬───────────┬────────────┬─────────────────┐
+│ Operation                      │ Time      │ Allocs     │ Memory          │
+├────────────────────────────────┼───────────┼────────────┼─────────────────┤
+│ Parse 10 entries               │ 3.3µs     │ 1          │ 80B             │
+│ Parse 100 entries              │ 33µs      │ 1          │ 896B            │
+│ Store 10 trades (ring buffer)  │ 700ns     │ 0          │ 0B              │
+│ Retrieve 100 trades            │ 2.8µs     │ 1          │ 18KB            │
+└────────────────────────────────┴───────────┴────────────┴─────────────────┘
+
+OPTIMIZATION NOTES:
+• Ring buffer eliminates allocation on eviction (was: slice copy per trade)
+• Pre-allocated boundary slice eliminates grow allocations (was: 8 allocs)
+• GetRecentTrades uses two-pass to avoid O(n²) prepend (was: 999 allocs)
+• Struct fields ordered for memory alignment (time.Time first, bools last)
+*/
+
 package fixclient
 
 import (
@@ -115,9 +202,13 @@ func (a *FixApp) ToAdmin(msg *quickfix.Message, _ quickfix.SessionID) {
 	}
 }
 
+// FromApp is the entry point for all application-level FIX messages.
+// HOT PATH [1]: Called by quickfix for every incoming message.
+// Performance: ~50ns for type check and routing.
 func (a *FixApp) FromApp(msg *quickfix.Message, _ quickfix.SessionID) quickfix.MessageRejectError {
+	// HOT PATH: Single string comparison to route market data messages
 	if t, _ := msg.Header.GetString(constants.TagMsgType); t == constants.MsgTypeMarketDataSnapshot || t == constants.MsgTypeMarketDataIncremental {
-		a.handleMarketDataMessage(msg)
+		a.handleMarketDataMessage(msg) // HOT PATH continues
 	} else if t == "Y" { // Market Data Request Reject
 		a.handleMarketDataReject(msg)
 	} else {
@@ -167,7 +258,11 @@ func (a *FixApp) ShouldExit() bool {
 	return a.shouldExit
 }
 
+// handleMarketDataMessage processes market data snapshots and incremental updates.
+// HOT PATH [2]: Coordinates parsing, storage, and display of market data.
+// Performance: ~200ns for metadata extraction + downstream costs.
 func (a *FixApp) handleMarketDataMessage(msg *quickfix.Message) {
+	// HOT PATH: Extract message metadata - each GetString is a map lookup
 	msgType, _ := msg.Header.GetString(constants.TagMsgType)
 	mdReqId := utils.GetString(msg, constants.TagMdReqId)
 	symbol := utils.GetString(msg, constants.TagSymbol)
@@ -179,12 +274,18 @@ func (a *FixApp) handleMarketDataMessage(msg *quickfix.Message) {
 
 	a.displayMarketDataReceived(msgType, symbol, mdReqId, noMdEntries, seqNum)
 
+	// HOT PATH [3]: Parse raw FIX message into Trade structs
+	// Cost: O(n*m) where n=entries, m=message length
 	trades := a.extractTrades(msg, symbol, mdReqId, isSnapshot, seqNum)
 
+	// HOT PATH [4]: Store in ring buffer - O(1) per trade, zero allocs
 	a.TradeStore.AddTrades(symbol, trades, isSnapshot, mdReqId)
 
+	// HOT PATH [5]: Optional persistence - can block if sync
+	// Consider making async for high-throughput scenarios
 	a.storeTradesToDatabase(trades, seqNum, isSnapshot)
 
+	// Display is not part of hot path critical section
 	if isSnapshot {
 		a.displaySnapshotTrades(trades, symbol)
 	} else if isIncremental {

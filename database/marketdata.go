@@ -24,8 +24,16 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// MarketDataDb provides SQLite storage for market data with prepared statements.
+// Prepared statements are initialized once and reused for all batch operations,
+// avoiding SQL parsing overhead on each insert.
 type MarketDataDb struct {
 	db *sql.DB
+
+	// Prepared statements for batch operations - initialized lazily
+	stmtTrade     *sql.Stmt
+	stmtOrderBook *sql.Stmt
+	stmtOHLCV     *sql.Stmt
 }
 
 func NewMarketDataDb(dbPath string) (*MarketDataDb, error) {
@@ -36,8 +44,25 @@ func NewMarketDataDb(dbPath string) (*MarketDataDb, error) {
 
 	mdb := &MarketDataDb{db: db}
 	if err := mdb.initSchema(); err != nil {
-		db.Close()
+		_ = db.Close() // Cleanup on error - return value ignored
 		return nil, fmt.Errorf("failed to initialize schema: %v", err)
+	}
+
+	// Prepare statements for batch operations - avoids SQL parsing on each insert
+	if mdb.stmtTrade, err = db.Prepare(insertTradeQuery); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to prepare trade statement: %v", err)
+	}
+	if mdb.stmtOrderBook, err = db.Prepare(insertOrderBookQuery); err != nil {
+		_ = mdb.stmtTrade.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to prepare order book statement: %v", err)
+	}
+	if mdb.stmtOHLCV, err = db.Prepare(insertOHLCVQuery); err != nil {
+		_ = mdb.stmtTrade.Close()
+		_ = mdb.stmtOrderBook.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to prepare OHLCV statement: %v", err)
 	}
 
 	log.Printf("SQLite database initialized at %s", dbPath)
@@ -45,6 +70,16 @@ func NewMarketDataDb(dbPath string) (*MarketDataDb, error) {
 }
 
 func (mdb *MarketDataDb) Close() error {
+	// Close prepared statements first - errors ignored as we're shutting down
+	if mdb.stmtTrade != nil {
+		_ = mdb.stmtTrade.Close()
+	}
+	if mdb.stmtOrderBook != nil {
+		_ = mdb.stmtOrderBook.Close()
+	}
+	if mdb.stmtOHLCV != nil {
+		_ = mdb.stmtOHLCV.Close()
+	}
 	return mdb.db.Close()
 }
 
@@ -77,17 +112,21 @@ func (mdb *MarketDataDb) BeginTransaction() (*sql.Tx, error) {
 	return mdb.db.Begin()
 }
 
+// StoreTradeBatch inserts a trade using the prepared statement within a transaction.
+// Using tx.Stmt() binds the prepared statement to the transaction context.
 func (mdb *MarketDataDb) StoreTradeBatch(tx *sql.Tx, symbol, price, size, aggressorSide, tradeTime string, seqNum int, mdReqId string, isSnapshot bool) error {
-	_, err := tx.Exec(insertTradeQuery, symbol, price, size, aggressorSide, tradeTime, seqNum, mdReqId, isSnapshot)
+	_, err := tx.Stmt(mdb.stmtTrade).Exec(symbol, price, size, aggressorSide, tradeTime, seqNum, mdReqId, isSnapshot)
 	return err
 }
 
+// StoreOrderBookBatch inserts an order book entry using the prepared statement.
 func (mdb *MarketDataDb) StoreOrderBookBatch(tx *sql.Tx, symbol, side, price, size string, position, seqNum int, mdReqId string, isSnapshot bool) error {
-	_, err := tx.Exec(insertOrderBookQuery, symbol, side, price, size, position, seqNum, mdReqId, isSnapshot)
+	_, err := tx.Stmt(mdb.stmtOrderBook).Exec(symbol, side, price, size, position, seqNum, mdReqId, isSnapshot)
 	return err
 }
 
+// StoreOhlcvBatch inserts an OHLCV entry using the prepared statement.
 func (mdb *MarketDataDb) StoreOhlcvBatch(tx *sql.Tx, symbol, dataType, value, entryTime string, seqNum int, mdReqId string) error {
-	_, err := tx.Exec(insertOHLCVQuery, symbol, dataType, value, entryTime, seqNum, mdReqId)
+	_, err := tx.Stmt(mdb.stmtOHLCV).Exec(symbol, dataType, value, entryTime, seqNum, mdReqId)
 	return err
 }

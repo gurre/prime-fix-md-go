@@ -17,7 +17,6 @@
 package fixclient
 
 import (
-	"fmt"
 	"log"
 	"strconv"
 	"time"
@@ -119,7 +118,8 @@ func (a *FixApp) createDatabaseSession(symbol, subscriptionType, marketDepth str
 		}
 	}
 
-	sessionId := fmt.Sprintf("%s_%s_%d", symbol, requestType, time.Now().Unix())
+	// Use string concatenation + strconv instead of fmt.Sprintf (faster for simple cases)
+	sessionId := symbol + "_" + requestType + "_" + strconv.FormatInt(time.Now().Unix(), 10)
 	err := a.Db.CreateSession(sessionId, symbol, requestType, dataTypes, reqId, depth)
 	if err != nil {
 		log.Printf("Failed to create session record: %v", err)

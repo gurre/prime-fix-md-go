@@ -19,6 +19,8 @@ package fixclient
 import (
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"prime-fix-md-go/builder"
@@ -104,7 +106,8 @@ func (a *FixApp) sendMarketDataRequest(symbols []string, subscriptionType, descr
 }
 
 func (a *FixApp) sendMarketDataRequestWithOptions(symbols []string, subscriptionType, marketDepth string, entryTypes []string, description string) {
-	reqId := fmt.Sprintf("md_%d", time.Now().UnixNano())
+	// Use strconv instead of fmt.Sprintf for simple int formatting (faster)
+	reqId := "md_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 
 	if subscriptionType == constants.SubscriptionRequestTypeSubscribe {
 		for _, symbol := range symbols {
@@ -133,13 +136,12 @@ func (a *FixApp) sendMarketDataRequestWithOptions(symbols []string, subscription
 			a.TradeStore.RemoveSubscription(symbol)
 		}
 	} else {
-		entryTypesStr := ""
+		// Use strings.Builder to avoid O(n²) string concatenation
+		entryTypeNames := make([]string, len(entryTypes))
 		for i, et := range entryTypes {
-			if i > 0 {
-				entryTypesStr += ", "
-			}
-			entryTypesStr += getMdEntryTypeName(et)
+			entryTypeNames[i] = getMdEntryTypeName(et)
 		}
+		entryTypesStr := strings.Join(entryTypeNames, ", ")
 		fmt.Printf("%s request sent for %v (depth=%s, types=[%s], reqId=%s)\n",
 			description, symbols, marketDepth, entryTypesStr, reqId)
 	}

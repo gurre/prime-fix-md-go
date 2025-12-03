@@ -1,6 +1,16 @@
 # Prime FIX Market Data Client
 
-> **Performance-First Design**: This client is optimized for low-latency market data processing. Hot path parsing achieves **~20µs for 100 entries** with single allocations, and the ring buffer storage delivers **zero-allocation writes**. Benchmarked on Apple M4 Pro—your mileage may vary.
+> **Performance-First Design**: This client is optimized for low-latency market data processing.
+>
+> | Operation | Latency | Allocations |
+> |-----------|---------|-------------|
+> | Parse 100 MD entries | 20µs | 1 (896B) |
+> | Parse single entry | 34-64ns | 0 |
+> | Store trade (ring buffer) | 74ns | 0 |
+> | Order update (exec report) | 40ns | 0 |
+> | Retrieve 100 trades | 3µs | 1 (18KB) |
+>
+> *Benchmarked on Apple M4 Pro. Run `go test -bench=. -benchmem ./fixclient/` to verify on your hardware.*
 
 A Go-based FIX protocol client for receiving real-time and snapshot market data from Coinbase Prime.
 
